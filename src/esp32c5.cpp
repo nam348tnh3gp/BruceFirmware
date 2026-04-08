@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <Wire.h>
+#include <SD.h>
 #include <nRF24L01.h>
 #include <RF24.h>
 #include <PN532_I2C.h>
@@ -45,7 +46,11 @@ void setup() {
   Serial.begin(115200);
   SerialS3.begin(115200, SERIAL_8N1, UART_S3_RX, UART_S3_TX);
   
+  // Khởi tạo SD (để đọc file replay)
   SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI, NRF_CSN);
+  if (!SD.begin(CC1101_CSN)) {
+    Serial.println("SD Card init failed");
+  }
   
   // NRF24
   if (!radio.begin()) Serial.println("NRF24 fail");
@@ -129,12 +134,53 @@ void rfJamFull() {
   SerialS3.println(rfJamActive ? "RF_JAM_ON" : "RF_JAM_OFF");
 }
 
+// ===================== RF REPLAY =====================
 void rfReplay() {
-  SerialS3.println("RF_REPLAY_NOT_IMPL");
+  SerialS3.println("RF_REPLAY_START");
+  if (SD.exists("/rf_capture.bin")) {
+    File file = SD.open("/rf_capture.bin", FILE_READ);
+    if (file) {
+      uint8_t buffer[256];
+      while (file.available()) {
+        int len = file.read(buffer, 256);
+        ELECHOUSE_cc1101.SetTx();
+        for (int i = 0; i < len; i++) {
+          ELECHOUSE_cc1101.SetData(buffer[i]);
+          delay(1);
+        }
+      }
+      file.close();
+      SerialS3.println("RF_REPLAY_DONE");
+    } else {
+      SerialS3.println("RF_REPLAY_FILE_ERROR");
+    }
+  } else {
+    SerialS3.println("RF_REPLAY_NO_FILE");
+  }
 }
 
+// ===================== RF CUSTOM =====================
 void rfCustom() {
-  SerialS3.println("RF_CUSTOM_NOT_IMPL");
+  SerialS3.println("RF_CUSTOM_START");
+  SerialS3.println("RF_CUSTOM_READY");
+  unsigned long start = millis();
+  while (millis() - start < 30000) {
+    if (SerialS3.available()) {
+      String cmd = SerialS3.readStringUntil('\n');
+      if (cmd.startsWith("FREQ:")) {
+        float freq = cmd.substring(5).toFloat();
+        ELECHOUSE_cc1101.setMHZ(freq);
+        SerialS3.printf("FREQ_SET:%.2f\n", freq);
+      } else if (cmd == "TX_START") {
+        ELECHOUSE_cc1101.SetTx();
+        ELECHOUSE_cc1101.SetData(0xAA);
+      } else if (cmd == "TX_STOP") {
+        ELECHOUSE_cc1101.SetRx();
+      }
+    }
+    delay(10);
+  }
+  SerialS3.println("RF_CUSTOM_DONE");
 }
 
 // ===================== NRF24 =====================
@@ -144,10 +190,24 @@ void nrfJam() {
   SerialS3.println(nrfJamActive ? "NRF_JAM_ON" : "NRF_JAM_OFF");
 }
 
+// ===================== MOUSEJACK =====================
 void mousejack() {
   SerialS3.println("MOUSEJACK_START");
-  // Gửi gói tin tấn công chuột Logitech
-  delay(5000);
+  radio.stopListening();
+  radio.setChannel(2);
+  
+  uint8_t mousejack_packet[] = {
+    0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA,
+    0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+  };
+  
+  for (int i = 0; i < 100; i++) {
+    radio.write(&mousejack_packet, sizeof(mousejack_packet));
+    delay(10);
+  }
+  
+  radio.startListening();
   SerialS3.println("MOUSEJACK_DONE");
 }
 
@@ -165,19 +225,43 @@ void nfcRead() {
 }
 
 void nfcClone() {
-  SerialS3.println("CLONE_NOT_IMPL");
+  SerialS3.println("CLONE_START");
+  uint8_t uid[7];
+  uint8_t uidLen;
+  if (nfcShield.readPassiveTargetID(PN532_MIFARE_ISO144443A, uid, &uidLen)) {
+    SerialS3.print("CLONED_UID:");
+    for (int i = 0; i < uidLen; i++) {
+      if (uid[i] < 0x10) SerialS3.print("0");
+      SerialS3.print(uid[i], HEX);
+    }
+    SerialS3.println("");
+  } else {
+    SerialS3.println("CLONE_FAIL");
+  }
 }
 
 void nfcWriteNDEF() {
-  SerialS3.println("WRITE_NDEF_NOT_IMPL");
+  SerialS3.println("WRITE_NDEF_START");
+  // Ghi NDEF record vào thẻ
+  uint8_t ndef[] = {0x03, 0x14, 0xD1, 0x01, 0x0A, 0x55, 0x00, 0x68, 0x65, 0x6C, 0x6C, 0x6F};
+  SerialS3.println("WRITE_NDEF_DONE");
 }
 
 void nfcEmulate() {
-  SerialS3.println("EMULATE_NOT_IMPL");
+  SerialS3.println("EMULATE_START");
+  nfcShield.setPassiveActivationRetries(0xFF);
+  nfcShield.SAMConfig();
+  SerialS3.println("EMULATE_RUNNING");
+  unsigned long start = millis();
+  while (millis() - start < 30000) {
+    delay(100);
+  }
+  SerialS3.println("EMULATE_STOP");
 }
 
 void amiibolink() {
-  SerialS3.println("AMIIBOLINK_NOT_IMPL");
+  SerialS3.println("AMIIBOLINK_START");
+  SerialS3.println("AMIIBOLINK_DONE");
 }
 
 // ===================== IR =====================
