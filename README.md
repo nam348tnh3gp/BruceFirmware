@@ -29,7 +29,9 @@ Copy toàn bộ nội dung thư mục sd_files/ vào thẻ nhớ FAT32 trước 
 🎮 Điều khiển
 
 · Phím UP/DOWN: Di chuyển trong menu
+
 · Phím CENTER: Chọn chức năng
+
 · Phím LEFT: Quay lại menu chính
 
 ⚠️ Disclaimer
