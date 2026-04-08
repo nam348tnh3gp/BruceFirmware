@@ -13,3 +13,25 @@ Xem chi tiết tại `include/pins_config.h`
 ```bash
 pio run -e esp32-s3
 pio run -e esp32-s3 -t upload
+```
+
+ESP32-C5
+
+```bash
+pio run -e esp32-c5
+pio run -e esp32-c5 -t upload
+```
+
+📂 Thư mục SD
+
+Copy toàn bộ nội dung thư mục sd_files/ vào thẻ nhớ FAT32 trước khi sử dụng.
+
+🎮 Điều khiển
+
+· Phím UP/DOWN: Di chuyển trong menu
+· Phím CENTER: Chọn chức năng
+· Phím LEFT: Quay lại menu chính
+
+⚠️ Disclaimer
+
+Chỉ sử dụng cho mục đích học tập và thử nghiệm trong môi trường được ủy quyền.
